@@ -307,19 +307,20 @@ function getRememberedToolCall(context, callId) {
   return context.pendingToolCalls?.get(callId) || GLOBAL_PENDING_TOOL_CALLS.get(callId);
 }
 
-function toolCallReasoningFallback(message) {
+function assistantReasoningFallback(message) {
   const names = (message.tool_calls || [])
     .map(tc => tc?.function?.name)
     .filter(Boolean)
     .join(', ');
-  return names ? `Calling tool(s): ${names}.` : 'Calling tool to continue the task.';
+  if (names) return `Calling tool(s): ${names}.`;
+  return 'Responding to the user based on the available context.';
 }
 
-function ensureToolCallReasoning(messages, model) {
+function ensureAssistantReasoning(messages, model) {
   if (!String(model || '').startsWith('deepseek')) return messages;
   for (const message of messages || []) {
-    if (message?.role !== 'assistant' || !Array.isArray(message.tool_calls) || message.tool_calls.length === 0) continue;
-    if (!message.reasoning_content) message.reasoning_content = toolCallReasoningFallback(message);
+    if (message?.role !== 'assistant') continue;
+    if (!message.reasoning_content) message.reasoning_content = assistantReasoningFallback(message);
   }
   return messages;
 }
@@ -428,7 +429,7 @@ function translateRequestBody(data, context = {}) {
       messages.unshift({ role: 'system', content: data.instructions });
       delete data.instructions;
     }
-    data.messages = ensureToolCallReasoning(messages, data.model);
+    data.messages = ensureAssistantReasoning(messages, data.model);
     delete data.input;
   }
 
@@ -944,7 +945,7 @@ function handleResponsesWsRequest(socket, incoming, context) {
   log('WS /responses request model:', originalModel, '| stream:', requestData.stream, '| input:', typeof requestData.input);
   requestData = translateRequestBody(requestData, context);
   const currentMessages = requestData.messages || [];
-  requestData.messages = ensureToolCallReasoning(mergeChatMessages(context.chatHistory, currentMessages), requestData.model);
+  requestData.messages = ensureAssistantReasoning(mergeChatMessages(context.chatHistory, currentMessages), requestData.model);
   requestData.stream = true;
   enableStreamUsage(requestData);
   const proxyBody = JSON.stringify(requestData);
@@ -1073,7 +1074,9 @@ function handleResponsesWsRequest(socket, incoming, context) {
       }
       context.chatHistory = mergeChatMessages(context.chatHistory, currentMessages);
       if (textItemStarted && !Object.values(toolCalls).some(t => t.added)) {
-        context.chatHistory.push({ role: 'assistant', content: accumulated });
+        const assistantMessage = { role: 'assistant', content: accumulated };
+        if (reasoningContent) assistantMessage.reasoning_content = reasoningContent;
+        context.chatHistory.push(assistantMessage);
       }
       if (outputItems.size === 0) {
         sendWsJson(socket, {type:'response.output_item.added',output_index:0,item:{id:msgId,type:'message',role:'assistant',status:'in_progress',content:[]}});
