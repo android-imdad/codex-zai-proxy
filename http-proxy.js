@@ -243,6 +243,36 @@ function stringifyToolOutput(output) {
   return truncateText(JSON.stringify(output || ''));
 }
 
+function estimateTokens(value) {
+  const text = typeof value === 'string' ? value : JSON.stringify(value || '');
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function normalizeUsage(upstreamUsage, requestData, outputText, toolCalls = {}) {
+  const inputTokens = upstreamUsage?.prompt_tokens ?? upstreamUsage?.input_tokens;
+  const outputTokens = upstreamUsage?.completion_tokens ?? upstreamUsage?.output_tokens;
+  const toolOutputText = Object.values(toolCalls).map(t => `${t.name || ''} ${t.args || ''}`).join('\n');
+  const fallbackInput = estimateTokens(requestData?.messages || requestData?.input || '');
+  const fallbackOutput = estimateTokens(`${outputText || ''}\n${toolOutputText}`);
+  const input = Number.isFinite(inputTokens) && inputTokens > 0 ? inputTokens : fallbackInput;
+  const output = Number.isFinite(outputTokens) && outputTokens > 0 ? outputTokens : fallbackOutput;
+  const totalTokens = upstreamUsage?.total_tokens;
+  const total = Number.isFinite(totalTokens) && totalTokens > 0 ? totalTokens : input + output;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: total,
+  };
+}
+
+function enableStreamUsage(requestData) {
+  if (!requestData?.stream) return;
+  requestData.stream_options = {
+    ...(requestData.stream_options || {}),
+    include_usage: true,
+  };
+}
+
 function toolCallToAssistantMessage(toolCall) {
   const message = {
     role: 'assistant',
@@ -491,6 +521,7 @@ const server = http.createServer((req, res) => {
         log('  input type:', typeof requestData.input, '| model:', requestData.model, '| stream:', requestData.stream, '| messages:', requestData.messages?.length);
         requestData = translateRequestBody(requestData);
         isStream = !!requestData.stream;
+        enableStreamUsage(requestData);
         targetPath = TARGET_API_PATH + '/chat/completions';
       } else if (url.startsWith('/v1/')) {
         targetPath = TARGET_API_PATH + url.replace(/^\/v1/, '');
@@ -599,6 +630,7 @@ const server = http.createServer((req, res) => {
           const respId = earlyRespId || ('resp_' + Date.now());
           const msgId = earlyMsgId || ('msg_' + Date.now());
           let accumulated = '';
+          let upstreamUsage = null;
           let textItemStarted = false;
           let outputIndex = 0;
           const toolCalls = {};
@@ -622,6 +654,7 @@ const server = http.createServer((req, res) => {
               if (!payload || payload === '[DONE]') continue;
               try {
                 const evt = JSON.parse(payload);
+                if (evt.usage) upstreamUsage = evt.usage;
                 if (!evt.choices || evt.choices.length === 0) continue;
 
                 const choice = evt.choices[0];
@@ -704,7 +737,8 @@ const server = http.createServer((req, res) => {
             }
 
             const finalOutput = [...finalOutputByIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item);
-            res.write(`event: response.completed\ndata: ${JSON.stringify({type:'response.completed',response:{id:respId,object:'response',status:'completed',model:originalModel||'gpt-5.5',output:finalOutput,output_text:accumulated,usage:{input_tokens:0,output_tokens:0,total_tokens:0}}})}\n\n`);
+            const usage = normalizeUsage(upstreamUsage, requestData, accumulated, toolCalls);
+            res.write(`event: response.completed\ndata: ${JSON.stringify({type:'response.completed',response:{id:respId,object:'response',status:'completed',model:originalModel||'gpt-5.5',output:finalOutput,output_text:accumulated,usage}})}\n\n`);
             res.end();
           });
 
@@ -870,6 +904,7 @@ function handleResponsesWsRequest(socket, incoming, context) {
   const currentMessages = requestData.messages || [];
   requestData.messages = mergeChatMessages(context.chatHistory, currentMessages);
   requestData.stream = true;
+  enableStreamUsage(requestData);
   const proxyBody = JSON.stringify(requestData);
   try { fs.writeFileSync(path.join(__dirname, 'last-translated-request.json'), proxyBody); } catch(e) {}
 
@@ -919,6 +954,7 @@ function handleResponsesWsRequest(socket, incoming, context) {
 
     let buffer = '';
     let accumulated = '';
+    let upstreamUsage = null;
     let reasoningContent = '';
     let textItemStarted = false;
     const toolCalls = {};
@@ -941,6 +977,7 @@ function handleResponsesWsRequest(socket, incoming, context) {
         if (!payload || payload === '[DONE]') continue;
         try {
           const evt = JSON.parse(payload);
+          if (evt.usage) upstreamUsage = evt.usage;
           const delta = evt.choices?.[0]?.delta;
           if (!delta) continue;
           if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
@@ -1005,7 +1042,8 @@ function handleResponsesWsRequest(socket, incoming, context) {
         outputItems.set(0, {id:msgId,type:'message',role:'assistant',status:'completed',content:[{type:'output_text',text:'',annotations:[]}]});
       }
       const output = [...outputItems.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item);
-      sendWsJson(socket, {type:'response.completed',response:{id:respId,object:'response',status:'completed',model:originalModel||'gpt-5.5',output,output_text:accumulated,usage:{input_tokens:0,output_tokens:0,total_tokens:0}}});
+      const usage = normalizeUsage(upstreamUsage, requestData, accumulated, toolCalls);
+      sendWsJson(socket, {type:'response.completed',response:{id:respId,object:'response',status:'completed',model:originalModel||'gpt-5.5',output,output_text:accumulated,usage}});
       log(`WS stream complete: ${accumulated.length} chars, ${Object.keys(toolCalls).length} tool calls`);
     });
   });
