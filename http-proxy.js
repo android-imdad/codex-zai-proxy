@@ -22,6 +22,9 @@ if (!TARGET_API_KEY) {
   process.exit(1);
 }
 
+const GLOBAL_PENDING_TOOL_CALLS = new Map();
+const MAX_PENDING_TOOL_CALLS = 1000;
+
 const MODEL_MAP = {
   // OpenAI -> GLM defaults
   'gpt-5.5': 'glm-5.1',
@@ -290,6 +293,20 @@ function toolCallToAssistantMessage(toolCall) {
   return message;
 }
 
+function rememberToolCall(context, toolCall) {
+  if (!toolCall?.id) return;
+  context.pendingToolCalls?.set(toolCall.id, toolCall);
+  GLOBAL_PENDING_TOOL_CALLS.set(toolCall.id, toolCall);
+  if (GLOBAL_PENDING_TOOL_CALLS.size > MAX_PENDING_TOOL_CALLS) {
+    const oldestKey = GLOBAL_PENDING_TOOL_CALLS.keys().next().value;
+    GLOBAL_PENDING_TOOL_CALLS.delete(oldestKey);
+  }
+}
+
+function getRememberedToolCall(context, callId) {
+  return context.pendingToolCalls?.get(callId) || GLOBAL_PENDING_TOOL_CALLS.get(callId);
+}
+
 function hasMatchingToolCall(message, callId) {
   return message?.role === 'assistant' &&
     Array.isArray(message.tool_calls) &&
@@ -348,11 +365,11 @@ function translateRequestBody(data, context = {}) {
         // Function call output (tool result)
         if (item.type === 'function_call_output' || item.type === 'mcp_tool_call_output') {
           const callId = item.call_id || item.id;
-          const pendingToolCall = context.pendingToolCalls?.get(callId);
+          const pendingToolCall = getRememberedToolCall(context, callId);
           if (pendingToolCall && !hasMatchingToolCall(messages[messages.length - 1], callId)) {
             messages.push(toolCallToAssistantMessage(pendingToolCall));
-            context.pendingToolCalls.delete(callId);
           }
+          context.pendingToolCalls?.delete(callId);
           messages.push({
             role: 'tool',
             tool_call_id: callId,
@@ -362,15 +379,20 @@ function translateRequestBody(data, context = {}) {
         }
         // Function call (assistant tool call)
         if (item.type === 'function_call') {
-          messages.push({
+          const callId = item.call_id || item.id;
+          const pendingToolCall = getRememberedToolCall(context, callId);
+          const assistantMessage = {
             role: 'assistant',
             content: null,
             tool_calls: [{
-              id: item.call_id || item.id,
+              id: callId,
               type: 'function',
               function: { name: upstreamToolNameFromCodexItem(item), arguments: item.arguments || '{}' },
             }],
-          });
+          };
+          const reasoningContent = item.reasoning_content || pendingToolCall?.reasoningContent;
+          if (reasoningContent) assistantMessage.reasoning_content = reasoningContent;
+          messages.push(assistantMessage);
           continue;
         }
         // Reasoning items - skip
@@ -631,6 +653,7 @@ const server = http.createServer((req, res) => {
           const msgId = earlyMsgId || ('msg_' + Date.now());
           let accumulated = '';
           let upstreamUsage = null;
+          let reasoningContent = '';
           let textItemStarted = false;
           let outputIndex = 0;
           const toolCalls = {};
@@ -660,6 +683,7 @@ const server = http.createServer((req, res) => {
                 const choice = evt.choices[0];
                 const delta = choice.delta;
                 if (!delta) continue;
+                if (delta.reasoning_content) reasoningContent += delta.reasoning_content;
 
                 const content = delta.content;
                 const tcDeltas = delta.tool_calls;
@@ -724,6 +748,7 @@ const server = http.createServer((req, res) => {
               res.write(`event: response.function_call_arguments.done\ndata: ${JSON.stringify({type:'response.function_call_arguments.done',item_id:t.itemId,output_index:t.outputIndex,arguments:t.args})}\n\n`);
               res.write(`event: response.output_item.done\ndata: ${JSON.stringify({type:'response.output_item.done',output_index:t.outputIndex,item:codexToolCallItem(t, t.args)})}\n\n`);
               finalOutputByIndex.set(t.outputIndex, codexToolCallItem(t, t.args));
+              rememberToolCall({}, {id:t.id,name:t.name,args:t.args,reasoningContent});
             }
 
             // If nothing was emitted at all, emit an empty text item so Codex doesn't hang
@@ -1024,7 +1049,7 @@ function handleResponsesWsRequest(socket, incoming, context) {
         sendWsJson(socket, {type:'response.function_call_arguments.done',item_id:t.itemId,output_index:t.outputIndex,arguments:t.args});
         sendWsJson(socket, {type:'response.output_item.done',output_index:t.outputIndex,item:codexToolCallItem(t, t.args)});
         outputItems.set(t.outputIndex, codexToolCallItem(t, t.args));
-        context.pendingToolCalls?.set(t.id, {id:t.id,name:t.name,args:t.args,reasoningContent});
+        rememberToolCall(context, {id:t.id,name:t.name,args:t.args,reasoningContent});
       }
       if (Object.values(toolCalls).some(t => t.added)) {
         log('WS tool calls:', Object.values(toolCalls).filter(t => t.added).map(t => `${t.name}->${codexToolDisplayName(t.name)}`).join(', '));
